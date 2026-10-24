@@ -1,0 +1,1248 @@
+name: Build AdBlock Pro APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-apk.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null || true
+            "$SDKM" "platforms;android-35" "build-tools;35.0.0" || true
+          fi
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" || true
+
+      - name: Create Gradle files
+        run: |
+          mkdir -p adblock/app/src/main/java/com/adblockpro/app
+          mkdir -p adblock/app/src/main/res/drawable
+          cd adblock
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AdBlockPro"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.adblockpro.app"
+              compileSdk = 35
+              buildToolsVersion = "35.0.0"
+
+              defaultConfig {
+                  applicationId = "com.adblockpro.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 3
+                  versionName = "1.2"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+      - name: Create manifest and resources
+        run: |
+          cd adblock/app/src/main
+
+          cat > AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="AdBlock Pro"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".BrowserActivity"
+                      android:exported="false"
+                      android:configChanges="orientation|screenSize|keyboardHidden" />
+
+                  <service
+                      android:name=".AdBlockVpnService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="dns_ad_blocking_vpn" />
+                  </service>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#1565C0"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,22 L84,34 L84,58 C84,74 70,86 54,92 C38,86 24,74 24,58 L24,34 Z" />
+              <path
+                  android:fillColor="#1565C0"
+                  android:pathData="M42,56 L48,50 L54,56 L60,50 L66,56 L54,68 Z" />
+          </vector>
+          EOF
+
+      - name: Create Kotlin - Blocklist (upgraded with CSS)
+        run: |
+          cat > adblock/app/src/main/java/com/adblockpro/app/Blocklist.kt <<'EOF'
+          package com.adblockpro.app
+
+          import android.content.Context
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.concurrent.CopyOnWriteArrayList
+
+          object Blocklist {
+
+              @Volatile
+              private var domains: HashSet<String> = HashSet()
+
+              @Volatile
+              private var cssRules: CopyOnWriteArrayList<String> = CopyOnWriteArrayList()
+
+              @Volatile
+              var size: Int = 0
+                  private set
+
+              @Volatile
+              var loaded: Boolean = false
+                  private set
+
+              private val ws = Regex("\\s+")
+
+              private val builtin = listOf(
+                  "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+                  "google-analytics.com", "googletagmanager.com", "googletagservices.com",
+                  "adservice.google.com", "app-measurement.com",
+                  "pagead2.googlesyndication.com", "tpc.googlesyndication.com",
+                  "stats.g.doubleclick.net", "ad.doubleclick.net",
+                  "securepubads.g.doubleclick.net", "cm.g.doubleclick.net",
+                  "partner.googleadservices.com", "fundingchoicesmessages.google.com",
+                  "adnxs.com", "adsrvr.org", "advertising.com", "taboola.com", "outbrain.com",
+                  "criteo.com", "criteo.net", "scorecardresearch.com", "quantserve.com",
+                  "moatads.com", "amazon-adsystem.com", "rubiconproject.com", "pubmatic.com",
+                  "openx.net", "adcolony.com", "applovin.com", "unityads.unity3d.com",
+                  "ads.unity3d.com", "mopub.com", "inmobi.com", "vungle.com", "chartboost.com",
+                  "startapp.com", "smaato.net", "tapjoy.com", "supersonicads.com",
+                  "ironsrc.com", "flurry.com", "an.facebook.com", "connect.facebook.net",
+                  "ads.yahoo.com", "adserver.yahoo.com", "analytics.yahoo.com",
+                  "popads.net", "propellerads.com", "exoclick.com", "juicyads.com",
+                  "adsterra.com", "revcontent.com", "mgid.com", "an.yandex.ru",
+                  "mc.yandex.ru", "hotjar.com", "mixpanel.com", "adform.net",
+                  "casalemedia.com", "contextweb.com", "yieldmo.com", "sharethrough.com",
+                  "teads.tv", "adition.com", "bidswitch.net", "smartadserver.com",
+                  "media.net", "zedo.com", "tribalfusion.com", "adroll.com",
+                  "bidvertiser.com", "revcontent.com", "gumgum.com", "mathtag.com",
+                  "krxd.net", "bluekai.com", "demdex.net", "omtrdc.net",
+                  "everesttech.net", "adsymptotic.com", "agkn.com", "adhigh.net",
+                  "adap.tv", "adentifi.com", "adlooxtracking.com", "admixer.net",
+                  "adnium.com", "adpushup.com", "adroll.com", "adsafeprotected.com",
+                  "adsafety.net", "adskeeper.com", "adsnative.com", "adspirit.de",
+                  "adtech.de", "adtechus.com", "adtruth.com", "adviqo.com",
+                  "adwhirl.com", "adwo.com", "adyoulike.com", "afy11.net",
+                  "aim4media.com", "airpush.com", "alexametrics.com", "am15.net",
+                  "amobee.com", "appads.com", "apsalar.com", "atdmt.com",
+                  "atwola.com", "audienceinsights.net", "avazutracking.net",
+                  "bannersnack.com", "betweendigital.com", "bidr.io", "bkrtx.com",
+                  "bounceexchange.com", "brealtime.com", "bttrack.com",
+                  "casale-media.com", "cedexis.com", "chartbeat.com", "clicktale.net",
+                  "collective-media.net", "conversantmedia.com", "crazyegg.com",
+                  "crwdcntrl.net", "dmtry.com", "dotomi.com", "doubleverify.com",
+                  "emxdgt.com", "exelator.com", "eyeota.net", "ibillboard.com",
+                  "imrworldwide.com", "indexww.com", "innovid.com", "intellitxt.com",
+                  "ipredictive.com", "jivox.com", "lijit.com", "loopme.me",
+                  "ml314.com", "mookie1.com", "nativo.com", "netmng.com",
+                  "nexage.com", "nrich.ai", "omnitagjs.com", "openx.com",
+                  "owneriq.net", "parsely.com", "pixalate.com", "platform161.com",
+                  "po.st", "pulsepoint.com", "quantcast.com", "rhythmone.com",
+                  "rlcdn.com", "rtbhouse.com", "safecount.net", "samba.tv",
+                  "semasio.net", "serving-sys.com", "sharethis.com", "simpli.fi",
+                  "sitescout.com", "smaato.com", "smartclip.net", "sociomantic.com",
+                  "sonobi.com", "sovrn.com", "spotxchange.com", "stackadapt.com",
+                  "stickyadstv.com", "storygize.net", "tapad.com", "tidaltv.com",
+                  "tremorhub.com", "triplelift.com", "tritondigital.com", "turn.com",
+                  "undertone.com", "unrulymedia.com", "usemax.de", "vidoomy.com",
+                  "vidora.com", "vindicosuite.com", "weborama.com", "weborama.fr",
+                  "webtrendslive.com", "yieldlab.net", "yieldoptimizer.com",
+                  "zeotap.com", "zeropark.com", "zeta.com", "zorosrv.com",
+                  "newrelic.com", "bugsnag.com", "sentry.io", "inspectlet.com",
+                  "luckyorange.com", "mouseflow.com", "fullstory.com",
+                  "logrocket.com", "smartlook.com", "adf.ly", "shorte.st",
+                  "ouo.io", "shink.me", "bc.vc"
+              )
+
+              private val builtinCss = listOf(
+                  "[id^=\"google_ads_\"]", "[id^=\"google-ads\"]", "[id^=\"aswift_\"]",
+                  "[id^=\"div-gpt-ad\"]", "[id^=\"div-gpt-\"]", "[class*=\"adsbygoogle\"]",
+                  "ins.adsbygoogle", ".adsbygoogle", "[class*=\"google-ad\"]",
+                  "iframe[src*=\"doubleclick\"]", "iframe[src*=\"googlesyndication\"]",
+                  "iframe[src*=\"googleadservices\"]", "iframe[src*=\"adservice\"]",
+                  "iframe[src*=\"adserver\"]", "iframe[src*=\"pagead\"]",
+                  "iframe[src*=\"amazon-adsystem\"]", "iframe[src*=\"/ads/\"]",
+                  "[id^=\"taboola-\"]", "[class*=\"taboola\"]", ".taboola-widget",
+                  "[id^=\"outbrain_widget\"]", ".OUTBRAIN", "[class*=\"outbrain\"]",
+                  "[id^=\"amzn_assoc_ad\"]", "[class*=\"amazon-ad\"]", ".media-ad-slot",
+                  "[id^=\"ad-slot\"]", "[class^=\"ad-slot\"]", "[class*=\" ad-slot\"]",
+                  "[id^=\"ad-banner\"]", "[class^=\"ad-banner\"]", "[class*=\" ad-banner\"]",
+                  "[class*=\"ad-container\"]", "[class*=\"ad-wrapper\"]",
+                  "[class*=\"ad-unit\"]", "[class*=\"ad-block\"]", "[class*=\"adsbox\"]",
+                  "[class*=\"advertisement\"]", "[id^=\"advertisement\"]",
+                  "[class*=\"advert\"]", "[class*=\"sponsor\"]", "[class*=\"sponsored\"]",
+                  "[class*=\"promoted\"]", "[data-ad-slot]", "[data-ad-unit]",
+                  "[data-ad]", "[data-ads]", "[data-ad-slot-id]",
+                  "[class~=\"ad\"]", "[class~=\"ads\"]", "[class~=\"advert\"]",
+                  "[class~=\"advertisement\"]", "[class~=\"sponsored\"]",
+                  "#masthead-ad", "#player-ads", "[id^=\"masthead-ad\"]",
+                  ".ytp-ad-overlay-slot", ".ytp-ad-overlay-container",
+                  ".ytp-ad-badge", ".ytp-ad-text", ".ytp-ad-image-overlay",
+                  ".ytp-ad-player-overlay-layout", ".ytp-ad-player-overlay",
+                  ".ytp-ad-progress", ".ytp-ad-survey", ".ytp-ad-skip-button",
+                  "ytd-promoted-sparkles-web-renderer", "ytd-display-ad-renderer",
+                  "ytd-promotedvideo-renderer", "ytd-in-feed-ad-layout-renderer",
+                  "ytd-ad-slot-renderer", "ytd-banner-promo-renderer",
+                  "ytd-statement-banner-renderer", "ytm-promoted-sparkles-web-renderer",
+                  "ytm-companion-slot", ".ytd-video-masthead-ad-v3-renderer",
+                  ".ytp-ad-skip-button-container", ".ytp-ad-skip-button-modern",
+                  "div[class*=\"banner-ad\"]", "div[class*=\"-ad-\"]",
+                  "div[class^=\"ad-\"]", "div[class$=\"-ad\"]",
+                  "aside[class*=\"ad-\"]", "section[class*=\"ad-\"]",
+                  "div[id^=\"ad_\"]", "div[id^=\"ad-\"]"
+              )
+
+              private fun jsSafe(s: String): String {
+                  val sb = StringBuilder(s.length + 2)
+                  for (c in s) {
+                      when (c) {
+                          '\\' -> sb.append("\\\\")
+                          '"' -> sb.append("\\\"")
+                          '\n' -> sb.append("\\n")
+                          '\r' -> sb.append("\\r")
+                          '\t' -> sb.append("\\t")
+                          else -> sb.append(c)
+                      }
+                  }
+                  return sb.toString()
+              }
+
+              fun listFile(ctx: Context): File = File(ctx.filesDir, "hosts.txt")
+
+              fun hasDownloadedList(ctx: Context): Boolean = listFile(ctx).exists()
+
+              fun load(ctx: Context) {
+                  val set = HashSet<String>(200000)
+                  builtin.forEach { set.add(it) }
+                  val f = listFile(ctx)
+                  if (f.exists()) {
+                      try {
+                          f.forEachLine { line ->
+                              val d = parseLine(line)
+                              if (d != null) set.add(d)
+                          }
+                      } catch (e: Exception) { }
+                  }
+                  domains = set
+                  val css = CopyOnWriteArrayList<String>()
+                  builtinCss.forEach { css.add(it) }
+                  cssRules = css
+                  size = set.size
+                  loaded = true
+              }
+
+              private fun parseLine(raw: String): String? {
+                  val line = raw.substringBefore('#').trim()
+                  if (line.isEmpty()) return null
+                  if (line.startsWith("||")) {
+                      var d = line.substring(2).substringBefore("^").substringBefore("/").substringBefore("$")
+                      if (d.contains('.') && d.isNotEmpty() && d.length < 200) return d.lowercase()
+                      return null
+                  }
+                  val parts = line.split(ws)
+                  val host: String = when {
+                      parts.size >= 2 && (parts[0] == "0.0.0.0" || parts[0] == "127.0.0.1") -> parts[1]
+                      parts.size == 1 && parts[0].contains('.') -> parts[0]
+                      else -> return null
+                  }
+                  val h = host.lowercase()
+                  if (h == "localhost" || h == "0.0.0.0" || h == "::1" || !h.contains('.')) return null
+                  if (h.length > 200) return null
+                  return h
+              }
+
+              fun isBlocked(name: String): Boolean {
+                  val set = domains
+                  var d = name.lowercase()
+                  while (true) {
+                      if (set.contains(d)) return true
+                      val i = d.indexOf('.')
+                      if (i < 0) return false
+                      d = d.substring(i + 1)
+                  }
+              }
+
+              fun shouldBlockUrl(url: String): Boolean {
+                  if (url.isBlank()) return false
+                  val host = try {
+                      URL(url).host ?: return false
+                  } catch (e: Exception) { return false }
+                  if (host.isEmpty()) return false
+                  return isBlocked(host)
+              }
+
+              fun cssForJs(): String {
+                  val css = cssRules
+                  if (css.isEmpty()) return ""
+                  val sb = StringBuilder()
+                  for (sel in css) {
+                      sb.append(sel)
+                      sb.append("{display:none !important;visibility:hidden !important;")
+                      sb.append("height:0 !important;width:0 !important;overflow:hidden !important;")
+                      sb.append("opacity:0 !important;pointer-events:none !important;}\n")
+                  }
+                  return jsSafe(sb.toString())
+              }
+
+              fun download(ctx: Context, url: String): Int {
+                  val tmp = File(ctx.filesDir, "hosts.tmp")
+                  val conn = URL(url).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 20000
+                  conn.readTimeout = 60000
+                  conn.setRequestProperty("User-Agent", "AdBlockPro/1.2 (Android)")
+                  try {
+                      if (conn.responseCode != 200) throw RuntimeException("HTTP " + conn.responseCode)
+                      conn.inputStream.use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
+                  } finally { conn.disconnect() }
+                  val dest = listFile(ctx)
+                  if (dest.exists()) dest.delete()
+                  if (!tmp.renameTo(dest)) throw RuntimeException("Could not save list")
+                  load(ctx)
+                  return size
+              }
+          }
+          EOF
+
+      - name: Create Kotlin - DNS helper
+        run: |
+          cat > adblock/app/src/main/java/com/adblockpro/app/DnsUtil.kt <<'EOF'
+          package com.adblockpro.app
+
+          import java.util.Arrays
+
+          object DnsUtil {
+              fun parseQuestion(dns: ByteArray, len: Int): Pair<String, Int>? {
+                  if (len < 17) return null
+                  var pos = 12
+                  val sb = StringBuilder()
+                  while (true) {
+                      if (pos >= len) return null
+                      val l = dns[pos].toInt() and 0xFF
+                      if (l == 0) { pos++; break }
+                      if ((l and 0xC0) != 0) return null
+                      pos++
+                      if (pos + l > len) return null
+                      if (sb.isNotEmpty()) sb.append('.')
+                      for (i in 0 until l) sb.append((dns[pos + i].toInt() and 0xFF).toChar())
+                      pos += l
+                  }
+                  if (pos + 4 > len) return null
+                  return Pair(sb.toString().lowercase(), pos + 4)
+              }
+
+              fun nxdomain(query: ByteArray, qEnd: Int): ByteArray {
+                  val r = query.copyOf(qEnd)
+                  val b2 = query[2].toInt()
+                  r[2] = (0x80 or (b2 and 0x79)).toByte()
+                  r[3] = (0x80 or 0x03).toByte()
+                  Arrays.fill(r, 6, 12, 0.toByte())
+                  return r
+              }
+
+              fun buildPacket(req: ByteArray, ihl: Int, dns: ByteArray): ByteArray {
+                  val udpLen = 8 + dns.size
+                  val total = 20 + udpLen
+                  val p = ByteArray(total)
+                  p[0] = 0x45.toByte()
+                  p[2] = (total shr 8).toByte()
+                  p[3] = (total and 0xFF).toByte()
+                  p[8] = 64
+                  p[9] = 17
+                  System.arraycopy(req, 16, p, 12, 4)
+                  System.arraycopy(req, 12, p, 16, 4)
+                  val ck = checksum(p, 0, 20)
+                  p[10] = (ck shr 8).toByte()
+                  p[11] = (ck and 0xFF).toByte()
+                  p[20] = req[ihl + 2]
+                  p[21] = req[ihl + 3]
+                  p[22] = req[ihl]
+                  p[23] = req[ihl + 1]
+                  p[24] = (udpLen shr 8).toByte()
+                  p[25] = (udpLen and 0xFF).toByte()
+                  System.arraycopy(dns, 0, p, 28, dns.size)
+                  return p
+              }
+
+              private fun checksum(b: ByteArray, off: Int, len: Int): Int {
+                  var sum = 0L
+                  var i = off
+                  while (i < off + len) {
+                      sum += (((b[i].toInt() and 0xFF) shl 8) or (b[i + 1].toInt() and 0xFF)).toLong()
+                      i += 2
+                  }
+                  while ((sum shr 16) != 0L) sum = (sum and 0xFFFFL) + (sum shr 16)
+                  return (sum.inv() and 0xFFFFL).toInt()
+              }
+          }
+          EOF
+
+      - name: Create Kotlin - VPN service
+        run: |
+          cat > adblock/app/src/main/java/com/adblockpro/app/AdBlockVpnService.kt <<'EOF'
+          package com.adblockpro.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.ParcelFileDescriptor
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.util.concurrent.ExecutorService
+          import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicLong
+
+          class AdBlockVpnService : VpnService() {
+
+              companion object {
+                  const val ACTION_START = "com.adblockpro.app.START"
+                  const val ACTION_STOP = "com.adblockpro.app.STOP"
+                  private const val CHANNEL_ID = "adblock_vpn"
+                  private const val NOTIF_ID = 1
+                  private const val VIRTUAL_DNS = "10.8.0.1"
+                  private val UPSTREAMS = listOf("1.1.1.1", "8.8.8.8")
+
+                  @Volatile var running = false
+                  val blocked = AtomicLong(0)
+                  val allowed = AtomicLong(0)
+              }
+
+              private var tun: ParcelFileDescriptor? = null
+              private var worker: Thread? = null
+              private var pool: ExecutorService? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      stopVpn()
+                      return START_NOT_STICKY
+                  }
+                  startForegroundCompat()
+                  startVpn()
+                  return START_NOT_STICKY
+              }
+
+              private fun startForegroundCompat() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL_ID, "AdBlock Pro", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, CHANNEL_ID)
+                      .setContentTitle("AdBlock Pro is active")
+                      .setContentText("Ads and trackers are being blocked")
+                      .setSmallIcon(android.R.drawable.ic_lock_lock)
+                      .setContentIntent(open)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(NOTIF_ID, n)
+                  }
+              }
+
+              private fun startVpn() {
+                  if (running) return
+                  Blocklist.load(this)
+                  val pfd: ParcelFileDescriptor? = try {
+                      Builder()
+                          .setSession("AdBlock Pro")
+                          .addAddress("10.8.0.2", 32)
+                          .addDnsServer(VIRTUAL_DNS)
+                          .addRoute(VIRTUAL_DNS, 32)
+                          .setMtu(1500)
+                          .establish()
+                  } catch (e: Exception) { null }
+                  if (pfd == null) { stopVpn(); return }
+                  tun = pfd
+                  running = true
+                  pool = Executors.newFixedThreadPool(8)
+                  val t = Thread { runLoop(pfd) }
+                  t.isDaemon = true
+                  t.start()
+                  worker = t
+              }
+
+              private fun runLoop(pfd: ParcelFileDescriptor) {
+                  val input = FileInputStream(pfd.fileDescriptor)
+                  val output = FileOutputStream(pfd.fileDescriptor)
+                  val buf = ByteArray(32767)
+                  try {
+                      while (running) {
+                          val n = input.read(buf)
+                          if (n < 0) break
+                          if (n == 0) { Thread.sleep(10); continue }
+                          handlePacket(buf.copyOf(n), n, output)
+                      }
+                  } catch (e: Exception) {
+                  } finally { running = false }
+              }
+
+              private fun handlePacket(pkt: ByteArray, len: Int, out: FileOutputStream) {
+                  if (len < 28) return
+                  if (((pkt[0].toInt() and 0xF0) shr 4) != 4) return
+                  val ihl = (pkt[0].toInt() and 0x0F) * 4
+                  if (ihl < 20) return
+                  if (pkt[9].toInt() != 17) return
+                  if (len < ihl + 8) return
+                  val dstPort = ((pkt[ihl + 2].toInt() and 0xFF) shl 8) or (pkt[ihl + 3].toInt() and 0xFF)
+                  if (dstPort != 53) return
+                  val total = ((pkt[2].toInt() and 0xFF) shl 8) or (pkt[3].toInt() and 0xFF)
+                  val end = minOf(total, len)
+                  val dnsLen = end - ihl - 8
+                  if (dnsLen < 12) return
+                  val dns = pkt.copyOfRange(ihl + 8, ihl + 8 + dnsLen)
+                  val q = DnsUtil.parseQuestion(dns, dns.size)
+                  if (q != null && Blocklist.isBlocked(q.first)) {
+                      blocked.incrementAndGet()
+                      val reply = DnsUtil.nxdomain(dns, q.second)
+                      write(out, DnsUtil.buildPacket(pkt, ihl, reply))
+                      return
+                  }
+                  allowed.incrementAndGet()
+                  try {
+                      pool?.execute { forward(pkt, ihl, dns, out) }
+                  } catch (e: Exception) { }
+              }
+
+              private fun forward(req: ByteArray, ihl: Int, dns: ByteArray, out: FileOutputStream) {
+                  for (up in UPSTREAMS) {
+                      var socket: DatagramSocket? = null
+                      try {
+                          socket = DatagramSocket()
+                          protect(socket)
+                          socket.soTimeout = 4000
+                          socket.send(DatagramPacket(dns, dns.size, InetAddress.getByName(up), 53))
+                          val rbuf = ByteArray(4096)
+                          val rp = DatagramPacket(rbuf, rbuf.size)
+                          socket.receive(rp)
+                          val resp = rbuf.copyOf(rp.length)
+                          write(out, DnsUtil.buildPacket(req, ihl, resp))
+                          return
+                      } catch (e: Exception) {
+                      } finally { socket?.close() }
+                  }
+              }
+
+              private fun write(out: FileOutputStream, data: ByteArray) {
+                  try { synchronized(out) { out.write(data) } } catch (e: Exception) { }
+              }
+
+              private fun stopVpn() {
+                  running = false
+                  try { tun?.close() } catch (e: Exception) { }
+                  tun = null
+                  pool?.shutdownNow()
+                  pool = null
+                  worker?.interrupt()
+                  worker = null
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              override fun onRevoke() { stopVpn(); super.onRevoke() }
+
+              override fun onDestroy() {
+                  running = false
+                  try { tun?.close() } catch (e: Exception) { }
+                  pool?.shutdownNow()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Create Kotlin - Browser (fully upgraded)
+        run: |
+          cat > adblock/app/src/main/java/com/adblockpro/app/BrowserActivity.kt <<'EOF'
+          package com.adblockpro.app
+
+          import android.app.Activity
+          import android.graphics.Bitmap
+          import android.graphics.drawable.ColorDrawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Message
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import java.io.ByteArrayInputStream
+
+          class BrowserActivity : Activity() {
+
+              companion object {
+                  const val HOME_URL = "https://duckduckgo.com"
+                  private const val HOSTS_URL =
+                      "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+              }
+
+              private lateinit var webView: WebView
+              private lateinit var urlBar: EditText
+              private lateinit var progressBar: ProgressBar
+              private lateinit var statusBar: TextView
+              private lateinit var blockedCounter: TextView
+
+              private var blockedCount = 0
+              private var pageStarted = false
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+                  bootFilters()
+
+                  val startUrl = intent.getStringExtra("url") ?: HOME_URL
+                  webView.loadUrl(startUrl)
+              }
+
+              private fun bootFilters() {
+                  Thread {
+                      Blocklist.load(applicationContext)
+                      runOnUiThread { updateFilterStatus() }
+
+                      if (!Blocklist.hasDownloadedList(applicationContext)) {
+                          runOnUiThread {
+                              statusBar.visibility = View.VISIBLE
+                              statusBar.text = "Downloading filter list (first run only)..."
+                          }
+                          val ok = try {
+                              Blocklist.download(applicationContext, HOSTS_URL)
+                              true
+                          } catch (e: Exception) { false }
+
+                          runOnUiThread {
+                              updateFilterStatus()
+                              statusBar.visibility = View.VISIBLE
+                              if (ok) {
+                                  statusBar.text = "Filter ready. Reloading..."
+                                  webView.reload()
+                              } else {
+                                  statusBar.text = "Using builtin list (" + Blocklist.size + "). Tap to retry."
+                                  statusBar.setOnClickListener { bootFilters() }
+                              }
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun updateFilterStatus() {
+                  blockedCounter.text = "Blocked: $blockedCount   |   Filter: ${Blocklist.size} domains"
+              }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(0xFFFFFFFF.toInt())
+
+                  val topBar = LinearLayout(this)
+                  topBar.orientation = LinearLayout.HORIZONTAL
+                  topBar.setPadding(dp(4), dp(6), dp(4), dp(6))
+                  topBar.setBackgroundColor(0xFF1565C0.toInt())
+                  topBar.gravity = Gravity.CENTER_VERTICAL
+
+                  val backBtn = Button(this)
+                  backBtn.text = "\u25C0"
+                  backBtn.textSize = 15f
+                  backBtn.setTextColor(0xFFFFFFFF.toInt())
+                  backBtn.setBackgroundColor(0x00000000)
+                  backBtn.setOnClickListener { if (webView.canGoBack()) webView.goBack() }
+
+                  val fwdBtn = Button(this)
+                  fwdBtn.text = "\u25B6"
+                  fwdBtn.textSize = 15f
+                  fwdBtn.setTextColor(0xFFFFFFFF.toInt())
+                  fwdBtn.setBackgroundColor(0x00000000)
+                  fwdBtn.setOnClickListener { if (webView.canGoForward()) webView.goForward() }
+
+                  urlBar = EditText(this)
+                  urlBar.hint = "Search or URL"
+                  urlBar.textSize = 13f
+                  urlBar.setSingleLine()
+                  urlBar.imeOptions = EditorInfo.IME_ACTION_GO
+                  urlBar.setBackgroundColor(0xFFFFFFFF.toInt())
+                  urlBar.setPadding(dp(10), dp(6), dp(10), dp(6))
+                  val urlLp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  urlLp.setMargins(dp(4), 0, dp(4), 0)
+                  urlBar.layoutParams = urlLp
+                  urlBar.setOnEditorActionListener { _, actionId, _ ->
+                      if (actionId == EditorInfo.IME_ACTION_GO) {
+                          navigate(urlBar.text.toString()); true
+                      } else false
+                  }
+
+                  val goBtn = Button(this)
+                  goBtn.text = "GO"
+                  goBtn.textSize = 13f
+                  goBtn.setTextColor(0xFFFFFFFF.toInt())
+                  goBtn.setBackgroundColor(0x00000000)
+                  goBtn.setOnClickListener { navigate(urlBar.text.toString()) }
+
+                  topBar.addView(backBtn)
+                  topBar.addView(fwdBtn)
+                  topBar.addView(urlBar)
+                  topBar.addView(goBtn)
+
+                  statusBar = TextView(this)
+                  statusBar.textSize = 12f
+                  statusBar.setTextColor(0xFF1565C0.toInt())
+                  statusBar.setPadding(dp(12), dp(6), dp(12), dp(6))
+                  statusBar.setBackgroundColor(0xFFE3F2FD.toInt())
+                  statusBar.visibility = View.GONE
+
+                  blockedCounter = TextView(this)
+                  blockedCounter.textSize = 11f
+                  blockedCounter.setTextColor(0xFF2E7D32.toInt())
+                  blockedCounter.setPadding(dp(12), dp(4), dp(12), dp(4))
+                  blockedCounter.setBackgroundColor(0xFFE8F5E9.toInt())
+                  blockedCounter.text = "Blocked: 0"
+
+                  progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  progressBar.max = 100
+                  progressBar.progressDrawable = ColorDrawable(0xFF2E7D32.toInt())
+                  progressBar.visibility = View.GONE
+
+                  webView = WebView(this)
+                  val webLp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                  )
+                  webView.layoutParams = webLp
+
+                  val s = webView.settings
+                  s.javaScriptEnabled = true
+                  s.domStorageEnabled = true
+                  s.loadWithOverviewMode = true
+                  s.useWideViewPort = true
+                  s.setSupportZoom(true)
+                  s.builtInZoomControls = true
+                  s.displayZoomControls = false
+                  s.mediaPlaybackRequiresUserGesture = true
+                  s.javaScriptCanOpenWindowsAutomatically = false
+
+                  webView.webViewClient = object : WebViewClient() {
+
+                      override fun shouldInterceptRequest(
+                          view: WebView?,
+                          request: WebResourceRequest?
+                      ): WebResourceResponse? {
+                          val url = request?.url?.toString() ?: return null
+                          val host = request.url.host ?: return null
+                          if (Blocklist.shouldBlockUrl(url)) {
+                              runOnUiThread {
+                                  blockedCount++
+                                  updateFilterStatus()
+                              }
+                              return WebResourceResponse(
+                                  "text/plain", "utf-8",
+                                  ByteArrayInputStream(ByteArray(0))
+                              )
+                          }
+                          return null
+                      }
+
+                      override fun shouldOverrideUrlLoading(
+                          view: WebView?,
+                          request: WebResourceRequest?
+                      ): Boolean {
+                          val url = request?.url?.toString() ?: return true
+                          if (Blocklist.shouldBlockUrl(url)) {
+                              runOnUiThread {
+                                  blockedCount++
+                                  updateFilterStatus()
+                              }
+                              return true
+                          }
+                          return false
+                      }
+
+                      override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                          super.onPageStarted(view, url, favicon)
+                          urlBar.setText(url)
+                          if (pageStarted) {
+                              blockedCount = 0
+                          }
+                          pageStarted = true
+                          updateFilterStatus()
+                      }
+
+                      override fun onPageCommitVisible(view: WebView?, url: String?) {
+                          super.onPageCommitVisible(view, url)
+                          injectCss()
+                      }
+
+                      override fun onPageFinished(view: WebView?, url: String?) {
+                          super.onPageFinished(view, url)
+                          progressBar.visibility = View.GONE
+                          injectCss()
+                          webView.postDelayed({ injectCss() }, 1200)
+                          webView.postDelayed({ injectCss() }, 3000)
+                      }
+                  }
+
+                  webView.webChromeClient = object : WebChromeClient() {
+                      override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                          super.onProgressChanged(view, newProgress)
+                          progressBar.progress = newProgress
+                          progressBar.visibility = if (newProgress < 100) View.VISIBLE else View.GONE
+                      }
+
+                      override fun onCreateWindow(
+                          view: WebView,
+                          isDialog: Boolean,
+                          isUserGesture: Boolean,
+                          resultMsg: Message
+                      ): Boolean {
+                          val popup = WebView(view.context)
+                          popup.settings.javaScriptEnabled = true
+                          popup.settings.domStorageEnabled = true
+                          popup.webViewClient = object : WebViewClient() {
+                              override fun shouldOverrideUrlLoading(
+                                  v: WebView?,
+                                  req: WebResourceRequest?
+                              ): Boolean {
+                                  val u = req?.url?.toString() ?: return true
+                                  if (!Blocklist.shouldBlockUrl(u)) {
+                                      webView.loadUrl(u)
+                                  } else {
+                                      runOnUiThread {
+                                          blockedCount++
+                                          updateFilterStatus()
+                                      }
+                                  }
+                                  return true
+                              }
+                          }
+                          val transport = resultMsg.obj as WebView.WebViewTransport
+                          transport.webView = popup
+                          resultMsg.sendToTarget()
+                          return true
+                      }
+                  }
+
+                  root.addView(topBar)
+                  root.addView(statusBar)
+                  root.addView(blockedCounter)
+                  root.addView(progressBar)
+                  root.addView(webView)
+                  setContentView(root)
+              }
+
+              private fun injectCss() {
+                  val css = Blocklist.cssForJs()
+                  if (css.isEmpty()) return
+                  val js = "(function(){try{" +
+                          "var id='__abp_style__';" +
+                          "var o=document.getElementById(id);if(o)o.remove();" +
+                          "var s=document.createElement('style');" +
+                          "s.id=id;s.type='text/css';" +
+                          "s.textContent=\"" + css + "\";" +
+                          "(document.head||document.documentElement).appendChild(s);" +
+                          "if(!window.__abpObs__){" +
+                          "window.__abpObs__=new MutationObserver(function(){" +
+                          "if(!document.getElementById('__abp_style__')){" +
+                          "try{(document.head||document.documentElement).appendChild(s);}catch(e){}" +
+                          "}});" +
+                          "window.__abpObs__.observe(document.documentElement,{childList:true,subtree:true});" +
+                          "}}catch(e){}})();"
+                  webView.evaluateJavascript(js, null)
+              }
+
+              private fun navigate(input: String) {
+                  var url = input.trim()
+                  if (url.isEmpty()) return
+                  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                      url = if (url.contains('.') && !url.contains(' ')) {
+                          "https://$url"
+                      } else {
+                          "https://duckduckgo.com/?q=" + Uri.encode(url)
+                      }
+                  }
+                  webView.loadUrl(url)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+              }
+
+              override fun onDestroy() {
+                  webView.destroy()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Create Kotlin - Main screen
+        run: |
+          cat > adblock/app/src/main/java/com/adblockpro/app/MainActivity.kt <<'EOF'
+          package com.adblockpro.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private val reqVpn = 100
+              private val listUrl = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+
+              private lateinit var status: TextView
+              private lateinit var stats: TextView
+              private lateinit var listInfo: TextView
+              private lateinit var toggle: Button
+              private lateinit var updateBtn: Button
+              private var autoDownloadTried = false
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      refresh()
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+                  bootFilters()
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+              }
+
+              private fun bootFilters() {
+                  Thread {
+                      Blocklist.load(applicationContext)
+                      runOnUiThread { refresh() }
+                      if (!Blocklist.hasDownloadedList(applicationContext) && !autoDownloadTried) {
+                          autoDownloadTried = true
+                          runOnUiThread {
+                              listInfo.text = "Downloading filter list (first run)..."
+                          }
+                          try {
+                              Blocklist.download(applicationContext, listUrl)
+                              runOnUiThread {
+                                  Toast.makeText(this, "Filter list ready: ${Blocklist.size} domains", Toast.LENGTH_LONG).show()
+                                  refresh()
+                              }
+                          } catch (e: Exception) {
+                              runOnUiThread {
+                                  listInfo.text = "Download failed. Tap UPDATE FILTER LIST."
+                              }
+                          }
+                      }
+                  }.start()
+              }
+
+              override fun onResume() { super.onResume(); handler.post(ticker) }
+              override fun onPause() { super.onPause(); handler.removeCallbacks(ticker) }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val scroll = ScrollView(this)
+                  scroll.setBackgroundColor(0xFFF5F7FA.toInt())
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.gravity = Gravity.CENTER_HORIZONTAL
+                  root.setPadding(dp(24), dp(32), dp(24), dp(24))
+
+                  val title = TextView(this)
+                  title.text = "AdBlock Pro"
+                  title.textSize = 28f
+                  title.typeface = Typeface.DEFAULT_BOLD
+                  title.setTextColor(0xFF1565C0.toInt())
+
+                  status = TextView(this)
+                  status.textSize = 18f
+                  status.setPadding(0, dp(8), 0, 0)
+
+                  toggle = Button(this)
+                  toggle.textSize = 22f
+                  toggle.typeface = Typeface.DEFAULT_BOLD
+                  toggle.setTextColor(0xFFFFFFFF.toInt())
+                  val bg = GradientDrawable()
+                  bg.shape = GradientDrawable.OVAL
+                  bg.setColor(0xFF1565C0.toInt())
+                  toggle.background = bg
+
+                  stats = TextView(this)
+                  stats.textSize = 16f
+                  stats.gravity = Gravity.CENTER
+                  stats.setTextColor(0xFF263238.toInt())
+
+                  listInfo = TextView(this)
+                  listInfo.textSize = 13f
+                  listInfo.gravity = Gravity.CENTER
+                  listInfo.setTextColor(0xFF607D8B.toInt())
+
+                  val browserBtn = Button(this)
+                  browserBtn.text = "BROWSE AD-FREE"
+                  browserBtn.textSize = 16f
+                  browserBtn.typeface = Typeface.DEFAULT_BOLD
+                  browserBtn.setTextColor(0xFFFFFFFF.toInt())
+                  val bbg = GradientDrawable()
+                  bbg.cornerRadius = dp(8).toFloat()
+                  bbg.setColor(0xFF2E7D32.toInt())
+                  browserBtn.background = bbg
+                  browserBtn.setPadding(dp(24), dp(12), dp(24), dp(12))
+                  browserBtn.setOnClickListener {
+                      startActivity(Intent(this, BrowserActivity::class.java))
+                  }
+
+                  updateBtn = Button(this)
+                  updateBtn.text = "UPDATE FILTER LIST"
+
+                  val note = TextView(this)
+                  note.text = "VPN mode blocks ads system-wide via DNS.\nFor website ads: tap BROWSE AD-FREE.\n\nNote: YouTube in-video ads and first-party ads\ncannot be blocked by any DNS/WebView method."
+                  note.textSize = 12f
+                  note.gravity = Gravity.CENTER
+                  note.setTextColor(0xFF90A4AE.toInt())
+
+                  val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
+                  val lpToggle = LinearLayout.LayoutParams(dp(150), dp(150))
+                  lpToggle.topMargin = dp(24)
+                  val lpStats = LinearLayout.LayoutParams(wrap, wrap)
+                  lpStats.topMargin = dp(20)
+                  val lpInfo = LinearLayout.LayoutParams(wrap, wrap)
+                  lpInfo.topMargin = dp(8)
+                  val lpBrowser = LinearLayout.LayoutParams(wrap, wrap)
+                  lpBrowser.topMargin = dp(24)
+                  val lpBtn = LinearLayout.LayoutParams(wrap, wrap)
+                  lpBtn.topMargin = dp(12)
+                  val lpNote = LinearLayout.LayoutParams(wrap, wrap)
+                  lpNote.topMargin = dp(20)
+
+                  root.addView(title)
+                  root.addView(status)
+                  root.addView(toggle, lpToggle)
+                  root.addView(stats, lpStats)
+                  root.addView(listInfo, lpInfo)
+                  root.addView(browserBtn, lpBrowser)
+                  root.addView(updateBtn, lpBtn)
+                  root.addView(note, lpNote)
+                  scroll.addView(root)
+                  setContentView(scroll)
+
+                  toggle.setOnClickListener {
+                      if (AdBlockVpnService.running) {
+                          val stop = Intent(this, AdBlockVpnService::class.java)
+                          stop.action = AdBlockVpnService.ACTION_STOP
+                          startService(stop)
+                      } else {
+                          val prep = VpnService.prepare(this)
+                          if (prep != null) startActivityForResult(prep, reqVpn) else startVpn()
+                      }
+                  }
+
+                  updateBtn.setOnClickListener {
+                      updateBtn.isEnabled = false
+                      updateBtn.text = "Updating..."
+                      Thread {
+                          val msg = try {
+                              val n = Blocklist.download(applicationContext, listUrl)
+                              "Updated: $n domains"
+                          } catch (e: Exception) {
+                              "Update failed: " + e.message
+                          }
+                          runOnUiThread {
+                              updateBtn.isEnabled = true
+                              updateBtn.text = "UPDATE FILTER LIST"
+                              Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                              refresh()
+                          }
+                      }.start()
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqVpn && resultCode == RESULT_OK) startVpn()
+              }
+
+              private fun startVpn() {
+                  val i = Intent(this, AdBlockVpnService::class.java)
+                  i.action = AdBlockVpnService.ACTION_START
+                  startForegroundService(i)
+              }
+
+              private fun refresh() {
+                  val on = AdBlockVpnService.running
+                  status.text = if (on) "VPN: ON" else "VPN: OFF"
+                  status.setTextColor(if (on) 0xFF2E7D32.toInt() else 0xFFC62828.toInt())
+                  toggle.text = if (on) "STOP" else "START"
+                  (toggle.background as GradientDrawable)
+                      .setColor(if (on) 0xFF2E7D32.toInt() else 0xFF1565C0.toInt())
+                  stats.text = "Blocked: " + AdBlockVpnService.blocked.get() +
+                      "\nAllowed: " + AdBlockVpnService.allowed.get()
+                  if (Blocklist.size > 0) {
+                      listInfo.text = "Filter list: " + Blocklist.size + " domains"
+                  }
+              }
+          }
+          EOF
+
+      - name: Show generated project
+        run: find adblock -type f | sort
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build debug APK
+        working-directory: adblock
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdBlock-Pro-APK
+          path: adblock/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
